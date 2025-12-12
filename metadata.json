@@ -1,0 +1,5 @@
+{
+  "name": "ShortsGen AI",
+  "description": "A client-side YouTube Shorts generator using Gemini Nano Banana for images and Gemini TTS for voiceovers. Turns JSON scripts into audio-visual stories.",
+  "requestFramePermissions": []
+}
