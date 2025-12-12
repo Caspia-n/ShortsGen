@@ -158,15 +158,40 @@ async function processJob(jobId, config) {
 
     let browser;
     try {
-        browser = await puppeteer.launch({
+        // Detect system browser to avoid architecture issues (ARM vs x64)
+        let executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+        if (!executablePath) {
+            const commonPaths = [
+                '/usr/bin/chromium',
+                '/usr/bin/chromium-browser',
+                '/usr/bin/google-chrome-stable',
+                '/usr/bin/google-chrome'
+            ];
+            for (const p of commonPaths) {
+                if (fs.existsSync(p)) {
+                    executablePath = p;
+                    console.log(`[${jobId}] ℹ️  Using system browser: ${executablePath}`);
+                    break;
+                }
+            }
+        }
+
+        const launchConfig = {
             headless: "new", 
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox',
-                '--autoplay-policy=no-user-gesture-required', // Crucial for AudioContext
-                '--use-gl=egl' // Helps with WebCodecs in headless envs
+                '--disable-dev-shm-usage', // Important for containerized envs
+                '--autoplay-policy=no-user-gesture-required',
+                '--use-gl=egl'
             ]
-        });
+        };
+
+        if (executablePath) {
+            launchConfig.executablePath = executablePath;
+        }
+
+        browser = await puppeteer.launch(launchConfig);
 
         const page = await browser.newPage();
         
