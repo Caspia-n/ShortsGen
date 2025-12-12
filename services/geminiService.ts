@@ -2,27 +2,33 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { decodeAudioData, audioBufferToWavBase64 } from "../utils/audio";
 import { WordTiming } from "../types";
 
-const API_KEY = process.env.API_KEY || '';
-
-// Initialize client
-// Note: In a real production app, we should handle the missing API key more gracefully UI-side
-const ai = new GoogleGenAI({ apiKey: API_KEY });
+// Helper to get the client with the most current key
+function getClient(providedKey?: string): GoogleGenAI {
+  // 1. Provided key (from UI state)
+  // 2. LocalStorage (persistence)
+  // 3. Environment variable (server/build time)
+  const key = providedKey || localStorage.getItem('gemini_api_key') || process.env.API_KEY;
+  
+  if (!key) {
+    throw new Error("API Key is missing. Please set it in the settings.");
+  }
+  
+  return new GoogleGenAI({ apiKey: key });
+}
 
 /**
  * Generates an image using the Nano Banana (Gemini Flash Image) model.
  */
-export async function generateImage(prompt: string): Promise<string> {
+export async function generateImage(prompt: string, apiKey?: string): Promise<string> {
   try {
+    const ai = getClient(apiKey);
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash-image',
       contents: {
         parts: [{ text: prompt }],
       },
       config: {
-        // Nano banana doesn't strictly support aspectRatio config in all envs yet, 
-        // but we pass it for best effort if supported or fallback to square/default.
-        // We prompt heavily for vertical composition in the text if needed, 
-        // but the model defaults are usually square.
+        // Nano banana default config
       },
     });
 
@@ -42,8 +48,9 @@ export async function generateImage(prompt: string): Promise<string> {
 /**
  * Generates speech using the Gemini TTS model.
  */
-export async function generateSpeech(text: string, voiceName: string = 'Kore', audioContext: AudioContext): Promise<AudioBuffer> {
+export async function generateSpeech(text: string, voiceName: string = 'Kore', audioContext: AudioContext, apiKey?: string): Promise<AudioBuffer> {
   try {
+    const ai = getClient(apiKey);
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
       contents: [{ parts: [{ text: text }] }],
@@ -74,15 +81,15 @@ export async function generateSpeech(text: string, voiceName: string = 'Kore', a
 
 /**
  * Uses Gemini 2.5 Flash to align audio with text and extract precise word timestamps.
- * This is "Pass 2" of the generation process to ensure actual syncing.
  */
-export async function generatePreciseTimings(audioBuffer: AudioBuffer, transcript: string): Promise<WordTiming[]> {
+export async function generatePreciseTimings(audioBuffer: AudioBuffer, transcript: string, apiKey?: string): Promise<WordTiming[]> {
   try {
+    const ai = getClient(apiKey);
+    
     // 1. Convert AudioBuffer to WAV Base64 so the model can hear it
     const wavBase64 = await audioBufferToWavBase64(audioBuffer);
 
     // 2. Call Gemini Flash (Multimodal)
-    // We ask it to analyze the audio and match it to the known text.
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: {
