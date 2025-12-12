@@ -12,7 +12,14 @@
     "@google/genai": "^1.33.0",
     "lucide-react": "^0.560.0",
     "react": "^19.2.2",
-    "react-dom": "^19.2.2"
+    "react-dom": "^19.2.2",
+    "uuid": "^13.0.0",
+    "puppeteer": "^24.33.0",
+    "express": "^5.2.1",
+    "url": "^0.11.4",
+    "path": "^0.12.7",
+    "cors": "^2.8.5",
+    "fs": "^0.0.1-security"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
