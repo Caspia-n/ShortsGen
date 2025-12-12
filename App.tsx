@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { ScriptInput } from './components/ScriptInput';
 import { Player } from './components/Player';
 import { SceneScript, GeneratedScene, GeneratorState, TransitionType } from './types';
-import { generateImage, generateSpeech } from './services/geminiService';
+import { generateImage, generateSpeech, generatePreciseTimings } from './services/geminiService';
 import { exportVideo } from './utils/videoExporter';
 import { generateWordTimings } from './utils/subtitleSync';
 import { Zap, Share2, Server } from 'lucide-react';
@@ -100,12 +100,22 @@ export default function App() {
 
         const visualPrompt = `Vertical video, 9:16 aspect ratio. ${script[i].imagePrompt}`;
         
+        // Step 1: Generate Visuals and Audio
         const [imageUrl, audioBuffer] = await Promise.all([
           generateImage(visualPrompt),
           generateSpeech(script[i].voiceOverText, voice, audioCtx)
         ]);
 
-        const wordTimings = generateWordTimings(script[i].voiceOverText, audioBuffer.duration);
+        // Step 2: Generate Subtitle Timings
+        // Try actual alignment first, fallback to heuristics if API fails or network issues occur
+        let wordTimings;
+        try {
+          console.log("Attempting precise audio alignment...");
+          wordTimings = await generatePreciseTimings(audioBuffer, script[i].voiceOverText);
+        } catch (e) {
+          console.warn("Precise alignment failed, falling back to heuristics.", e);
+          wordTimings = generateWordTimings(script[i].voiceOverText, audioBuffer.duration);
+        }
 
         processedScenes[i] = {
           ...processedScenes[i],
