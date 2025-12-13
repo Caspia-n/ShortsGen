@@ -212,7 +212,8 @@ async function processJob(jobId, config) {
         }
 
         const launchConfig = {
-            headless: "new", 
+            headless: "new",
+            protocolTimeout: 0, // Disable protocol timeout to allow long renders
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox',
@@ -245,36 +246,40 @@ async function processJob(jobId, config) {
         // Inject the Job
         console.log(`[${jobId}] Injecting script...`);
         
-        // Evaluate the generation logic in the browser context
-        const result = await page.evaluate(async (jobConfig) => {
-            // Check if our hook exists (defined in App.tsx)
+        // 1. Trigger the job (Fire and Forget in context)
+        // We use evaluate to CALL the function, but we do NOT await the async completion inside the browser.
+        // We just ensure the function started successfully.
+        const triggerResult = await page.evaluate((jobConfig) => {
             if (!(window).startHeadlessJob) {
                 return { error: "App not ready or headless hook missing. Did the page load correctly?" };
             }
             
-            // Start the job
-            await (window).startHeadlessJob(jobConfig);
+            // Kick off the async job without awaiting it here to avoid evaluate timeout
+            (window).startHeadlessJob(jobConfig)
+                .catch(err => {
+                    console.error("Headless Job Failed inside App:", err);
+                    (window).JOB_ERROR = err.message || "Unknown error";
+                });
 
-            // Poll for the result
-            return await new Promise((resolve) => {
-                const start = Date.now();
-                const checkInterval = setInterval(() => {
-                    if ((window).RENDERED_VIDEO_DATA) {
-                        clearInterval(checkInterval);
-                        resolve({ success: true, data: (window).RENDERED_VIDEO_DATA });
-                    }
-                    if ((window).JOB_ERROR) {
-                        clearInterval(checkInterval);
-                        resolve({ error: (window).JOB_ERROR });
-                    }
-                    // Timeout after 5 minutes
-                    if (Date.now() - start > 300000) {
-                        clearInterval(checkInterval);
-                        resolve({ error: "Timeout waiting for video render" });
-                    }
-                }, 1000);
-            });
+            return { success: true };
         }, config);
+
+        if (triggerResult.error) {
+            throw new Error(triggerResult.error);
+        }
+
+        // 2. Wait for the result using waitForFunction
+        // This polls the page periodically and is robust against long wait times
+        console.log(`[${jobId}] Waiting for render...`);
+        await page.waitForFunction(() => {
+            return (window).RENDERED_VIDEO_DATA || (window).JOB_ERROR;
+        }, { timeout: 600000, polling: 1000 }); // 10 minute timeout
+
+        // 3. Retrieve Result
+        const result = await page.evaluate(() => {
+            if ((window).JOB_ERROR) return { error: (window).JOB_ERROR };
+            return { success: true, data: (window).RENDERED_VIDEO_DATA };
+        });
 
         if (result.error) {
             throw new Error(result.error);
