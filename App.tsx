@@ -17,6 +17,11 @@ function b64_to_utf8(str: string) {
   return decodeURIComponent(escape(window.atob(str)));
 }
 
+// Log helper for headless mode
+const logHeadless = (msg: string) => {
+  console.log(`[Headless Job] ${msg}`);
+};
+
 export default function App() {
   const [scenes, setScenes] = useState<GeneratedScene[]>([]);
   const [appState, setAppState] = useState<GeneratorState>(GeneratorState.IDLE);
@@ -46,18 +51,27 @@ export default function App() {
     // Expose a global function for Puppeteer/Server to call
     (window as any).startHeadlessJob = async (config: { script: SceneScript[], voice: string, showSubtitles: boolean, apiKey?: string }) => {
       try {
-        console.log("Headless Job Started", config);
+        logHeadless(`Starting job with ${config.script.length} scenes`);
         
+        // Reset globals
+        (window as any).JOB_PROGRESS = 0;
+        (window as any).RENDERED_VIDEO_DATA = null;
+        (window as any).JOB_ERROR = null;
+
         // If the server passes an API key (e.g., from its env), use it.
-        // Otherwise, handleGenerate will try to fall back to the App's state or localStorage/Env
         const effectiveKey = config.apiKey || apiKey;
+        if (!effectiveKey) {
+            throw new Error("No API Key provided for headless job");
+        }
 
         // 1. Generate Assets
-        const generatedScenes = await handleGenerate(config.script, config.voice || 'Kore', config.showSubtitles, effectiveKey);
+        const generatedScenes = await handleGenerate(config.script, config.voice || 'Kore', config.showSubtitles, effectiveKey, true);
         
         // 2. Export Video
+        logHeadless("Assets generated. Starting export...");
         await handleExport(generatedScenes, config.showSubtitles, true);
         
+        logHeadless("Job Complete.");
         return { status: 'success' };
       } catch (e: any) {
         console.error("Headless Job Error", e);
@@ -65,7 +79,7 @@ export default function App() {
         return { status: 'error', message: e.message };
       }
     };
-  }, [apiKey]); // Depend on apiKey to ensure latest state is available if needed
+  }, [apiKey]); 
 
   // Auto-generation logic for URL params
   useEffect(() => {
@@ -85,7 +99,6 @@ export default function App() {
         const script = JSON.parse(jsonString) as SceneScript[];
         window.history.replaceState({}, '', window.location.pathname);
         
-        // Wait for key to load effectively, or use what we have
         handleGenerate(script, 'Kore', true).then(() => {
           if (autoPlay) {
             console.log("Auto-generation complete.");
@@ -97,13 +110,20 @@ export default function App() {
     }
   }, []);
 
-  const handleGenerate = async (script: SceneScript[], voice: string, enableSubtitles: boolean, overrideKey?: string): Promise<GeneratedScene[]> => {
-    // Use override key (from headless), or state key
+  const handleGenerate = async (
+      script: SceneScript[], 
+      voice: string, 
+      enableSubtitles: boolean, 
+      overrideKey?: string,
+      isHeadless: boolean = false
+  ): Promise<GeneratedScene[]> => {
     const currentKey = overrideKey || apiKey;
     
     setAppState(GeneratorState.PROCESSING);
     setShowSubtitles(enableSubtitles);
     
+    (window as any).JOB_PROGRESS = 0;
+
     const transitions: TransitionType[] = ['zoom', 'slide', 'fade'];
 
     const initialScenes: GeneratedScene[] = script.map((s, index) => ({
@@ -119,23 +139,34 @@ export default function App() {
     const processedScenes = [...initialScenes];
 
     try {
+      const totalSteps = script.length;
+      const GENERATION_PHASE_WEIGHT = 90; // 90% of progress for generation
+
       for (let i = 0; i < script.length; i++) {
         processedScenes[i] = { ...processedScenes[i], status: 'generating' };
         setScenes([...processedScenes]);
 
+        const baseProgress = (i / totalSteps) * GENERATION_PHASE_WEIGHT;
+        const stepSize = (1 / totalSteps) * GENERATION_PHASE_WEIGHT;
+        
+        if (isHeadless) logHeadless(`Processing Scene ${i + 1}/${totalSteps}`);
+
         const visualPrompt = `Vertical video, 9:16 aspect ratio. ${script[i].imagePrompt}`;
         
-        // Step 1: Generate Visuals and Audio
-        // Pass the key to the services
-        const [imageUrl, audioBuffer] = await Promise.all([
-          generateImage(visualPrompt, currentKey),
-          generateSpeech(script[i].voiceOverText, voice, audioCtx, currentKey)
-        ]);
+        // Step 1: Image
+        if (isHeadless) logHeadless(`Scene ${i + 1}: Generating Image...`);
+        const imageUrl = await generateImage(visualPrompt, currentKey);
+        (window as any).JOB_PROGRESS = Math.round(baseProgress + (stepSize * 0.4)); // 40% of step
 
-        // Step 2: Generate Subtitle Timings
+        // Step 2: Audio
+        if (isHeadless) logHeadless(`Scene ${i + 1}: Generating Audio...`);
+        const audioBuffer = await generateSpeech(script[i].voiceOverText, voice, audioCtx, currentKey);
+        (window as any).JOB_PROGRESS = Math.round(baseProgress + (stepSize * 0.8)); // 80% of step
+
+        // Step 3: Timings
         let wordTimings;
         try {
-          console.log("Attempting precise audio alignment...");
+          if (isHeadless) logHeadless(`Scene ${i + 1}: Aligning Audio...`);
           wordTimings = await generatePreciseTimings(audioBuffer, script[i].voiceOverText, currentKey);
         } catch (e) {
           console.warn("Precise alignment failed, falling back to heuristics.", e);
@@ -150,20 +181,24 @@ export default function App() {
           status: 'completed'
         };
         setScenes([...processedScenes]);
+        
+        // Complete step
+        (window as any).JOB_PROGRESS = Math.round(baseProgress + stepSize);
       }
+      
       setAppState(GeneratorState.READY);
       return processedScenes;
       
     } catch (error: any) {
       console.error("Workflow failed", error);
       setAppState(GeneratorState.IDLE);
+      if (isHeadless) logHeadless(`Error: ${error.message}`);
       
-      // If unauthorized, prompt for key
       if (error.message && (error.message.includes('API key') || error.message.includes('401') || error.message.includes('403'))) {
          setShowKeyModal(true);
-         alert("API Key missing or invalid. Please check your settings.");
+         if (!isHeadless) alert("API Key missing or invalid.");
       } else {
-         alert("Generation failed: " + error.message);
+         if (!isHeadless) alert("Generation failed: " + error.message);
       }
       throw error;
     }
@@ -179,14 +214,23 @@ export default function App() {
     
     try {
       const blob = await exportVideo(scenesToExport, subtitlesEnabled, (progress) => {
-        console.log(`Export progress: ${progress.toFixed(0)}%`);
+        // Map export progress (0-100) to the remaining 10% (90-100)
+        const totalProgress = 90 + (progress * 0.1);
+        (window as any).JOB_PROGRESS = Math.min(99, Math.round(totalProgress));
+        
+        // Log every 20%
+        if (isHeadless && Math.round(progress) % 20 === 0) {
+            logHeadless(`Exporting: ${Math.round(progress)}%`);
+        }
       });
       
       if (isHeadless) {
         const reader = new FileReader();
         reader.readAsDataURL(blob);
         reader.onloadend = () => {
+           (window as any).JOB_PROGRESS = 100;
            (window as any).RENDERED_VIDEO_DATA = reader.result; 
+           logHeadless("Video data ready.");
         };
       } else {
         const url = URL.createObjectURL(blob);
@@ -199,8 +243,9 @@ export default function App() {
         URL.revokeObjectURL(url);
       }
 
-    } catch (e) {
+    } catch (e: any) {
       console.error("Export failed", e);
+      if (isHeadless) logHeadless(`Export Error: ${e.message}`);
       if (!isHeadless) alert("Failed to export video. Please try again.");
       throw e;
     } finally {
@@ -236,8 +281,6 @@ export default function App() {
           <h1 className="text-xl font-bold tracking-tighter text-white">ShortsGen <span className="text-zinc-500 font-normal">AI</span></h1>
         </div>
         <div className="ml-auto flex items-center gap-4">
-           
-           {/* API Key Button */}
            <button
              onClick={() => setShowKeyModal(true)}
              className={`flex items-center gap-2 px-3 py-1.5 rounded-md border text-xs font-mono transition-colors
@@ -248,12 +291,10 @@ export default function App() {
              <Key size={12} />
              <span>{apiKey ? 'API Key Set' : 'Set API Key'}</span>
            </button>
-
            <div className="hidden md:flex items-center gap-2 px-3 py-1 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-500 text-xs">
               <Server size={12} />
               <span>API Ready</span>
            </div>
-
            <button 
              onClick={handleCopyApiUrl}
              className="text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-300 py-1.5 px-3 rounded-md flex items-center gap-2 transition-colors font-mono"
@@ -266,8 +307,6 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-grow flex flex-col md:flex-row overflow-hidden">
-        
-        {/* Left Panel: Input */}
         <div className="w-full md:w-1/2 p-4 md:p-8 flex flex-col h-[50vh] md:h-auto border-b md:border-b-0 md:border-r border-zinc-800">
            <div className="max-w-2xl w-full mx-auto h-full">
               <div className="mb-6">
@@ -284,8 +323,6 @@ export default function App() {
               </div>
            </div>
         </div>
-
-        {/* Right Panel: Preview */}
         <div className="w-full md:w-1/2 bg-zinc-950 relative">
            <Player 
               scenes={scenes} 
@@ -296,7 +333,6 @@ export default function App() {
               showSubtitles={showSubtitles}
            />
         </div>
-
       </main>
     </div>
   );

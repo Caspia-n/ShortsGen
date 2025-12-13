@@ -138,6 +138,7 @@ app.post('/api/generate', async (req, res) => {
     jobs.set(jobId, {
         id: jobId,
         status: 'queued',
+        progress: 0,
         createdAt: Date.now(),
         config: { ...jobConfig, sceneCount: script.length }
     });
@@ -148,6 +149,7 @@ app.post('/api/generate', async (req, res) => {
     res.json({ 
         jobId, 
         status: 'queued',
+        progress: 0,
         message: "Video generation started.",
         statusUrl: `${CLIENT_URL}/api/status/${jobId}`
     });
@@ -168,17 +170,24 @@ app.get('/api/status/:id', (req, res) => {
     // Don't leak the API key in the status response
     const { config, ...safeJobData } = job;
     
-    if (safeJobData.status === 'completed') {
+    // Explicitly ensure progress is set
+    const responseData = {
+        ...safeJobData,
+        progress: safeJobData.progress || 0
+    };
+    
+    if (responseData.status === 'completed') {
         return res.json({
-            id: safeJobData.id,
+            id: responseData.id,
             status: 'completed',
-            videoUrl: `${CLIENT_URL}/videos/${safeJobData.filename}`,
+            progress: 100,
+            videoUrl: `${CLIENT_URL}/videos/${responseData.filename}`,
             expiresIn: "48 hours",
-            completedAt: safeJobData.completedAt
+            completedAt: responseData.completedAt
         });
     }
 
-    res.json(safeJobData);
+    res.json(responseData);
 });
 
 // --- Worker Logic ---
@@ -214,6 +223,7 @@ async function processJob(jobId, config) {
         const launchConfig = {
             headless: "new",
             protocolTimeout: 0, // Disable protocol timeout to allow long renders
+            dumpio: true, // Log stdio from browser
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox',
@@ -247,14 +257,12 @@ async function processJob(jobId, config) {
         console.log(`[${jobId}] Injecting script...`);
         
         // 1. Trigger the job (Fire and Forget in context)
-        // We use evaluate to CALL the function, but we do NOT await the async completion inside the browser.
-        // We just ensure the function started successfully.
         const triggerResult = await page.evaluate((jobConfig) => {
             if (!(window).startHeadlessJob) {
                 return { error: "App not ready or headless hook missing. Did the page load correctly?" };
             }
             
-            // Kick off the async job without awaiting it here to avoid evaluate timeout
+            // Kick off the async job without awaiting it here
             (window).startHeadlessJob(jobConfig)
                 .catch(err => {
                     console.error("Headless Job Failed inside App:", err);
@@ -268,28 +276,48 @@ async function processJob(jobId, config) {
             throw new Error(triggerResult.error);
         }
 
-        // 2. Wait for the result using waitForFunction
-        // This polls the page periodically and is robust against long wait times
+        // 2. Poll for the result while updating progress
         console.log(`[${jobId}] Waiting for render...`);
-        await page.waitForFunction(() => {
-            return (window).RENDERED_VIDEO_DATA || (window).JOB_ERROR;
-        }, { timeout: 600000, polling: 1000 }); // 10 minute timeout
+        
+        const TIMEOUT_MS = 1800000; // 30 minutes
+        const POLL_INTERVAL_MS = 2000;
+        const startTime = Date.now();
+        let finalData = null;
 
-        // 3. Retrieve Result
-        const result = await page.evaluate(() => {
-            if ((window).JOB_ERROR) return { error: (window).JOB_ERROR };
-            return { success: true, data: (window).RENDERED_VIDEO_DATA };
-        });
+        while (Date.now() - startTime < TIMEOUT_MS) {
+            // Check status in browser
+            const status = await page.evaluate(() => ({
+                data: (window).RENDERED_VIDEO_DATA,
+                error: (window).JOB_ERROR,
+                progress: (window).JOB_PROGRESS || 0
+            }));
 
-        if (result.error) {
-            throw new Error(result.error);
+            if (status.data) {
+                finalData = status.data;
+                job.progress = 100;
+                break;
+            }
+
+            if (status.error) {
+                throw new Error(status.error);
+            }
+
+            // Update job progress in memory so API clients see it
+            job.progress = Math.round(status.progress);
+            
+            // Sleep
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        }
+
+        if (!finalData) {
+            throw new Error("Timeout waiting for video render (30m limit exceeded)");
         }
 
         // Save File
         console.log(`[${jobId}] Rendering complete. Saving file...`);
         
         // The data is a Base64 Data URL: "data:video/mp4;base64,AAAA..."
-        const base64Data = result.data.split(',')[1];
+        const base64Data = finalData.split(',')[1];
         const buffer = Buffer.from(base64Data, 'base64');
         const filename = `${jobId}.mp4`;
         const filePath = path.join(VIDEO_STORAGE_DIR, filename);
