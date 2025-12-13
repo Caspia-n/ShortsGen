@@ -5,7 +5,7 @@
  * It uses Puppeteer to launch a headless browser, load the React App, 
  * inject the script, and capture the generated video.
  * 
- * Dependencies: express, puppeteer, cors, uuid
+ * Dependencies: express, puppeteer, cors, uuid, @google/genai
  * Run: node server.js
  */
 
@@ -16,6 +16,7 @@ import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { GoogleGenAI } from '@google/genai';
 
 // Replicate __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -89,29 +90,60 @@ app.get('/api/voices', (req, res) => {
 
 /**
  * POST /api/generate
+ * Headers: 
+ *   x-google-api-key: "YOUR_GEMINI_KEY"
+ * 
  * Body: { 
  *   script: [{ voiceOverText, imagePrompt }, ...], 
  *   voice: "Kore", 
- *   showSubtitles: true 
+ *   showSubtitles: true,
+ *   apiKey: "OPTIONAL_ALTERNATIVE_LOCATION" 
  * }
  */
 app.post('/api/generate', async (req, res) => {
     const { script, voice = 'Kore', showSubtitles = true } = req.body;
+    
+    // 1. Extract API Key
+    const apiKey = req.headers['x-google-api-key'] || req.body.apiKey;
+
+    if (!apiKey) {
+        return res.status(401).json({ 
+            error: "Authentication required. Please provide a Gemini API Key via 'x-google-api-key' header or 'apiKey' body field." 
+        });
+    }
+
+    // 2. Validate API Key (Lightweight check)
+    try {
+        const ai = new GoogleGenAI({ apiKey });
+        // We fetch a model definition to verify the key is active
+        await ai.models.get({ model: 'gemini-2.5-flash' });
+    } catch (e) {
+        console.error("Auth failed:", e.message);
+        return res.status(401).json({ error: "Invalid Gemini API Key provided." });
+    }
 
     if (!script || !Array.isArray(script)) {
         return res.status(400).json({ error: "Invalid script format. Must be an array of scenes." });
     }
 
     const jobId = uuidv4();
+    
+    const jobConfig = { 
+        script, 
+        voice, 
+        showSubtitles, 
+        apiKey // Pass the validated key to the worker
+    };
+
     jobs.set(jobId, {
         id: jobId,
         status: 'queued',
         createdAt: Date.now(),
-        config: { voice, showSubtitles, sceneCount: script.length }
+        config: { ...jobConfig, sceneCount: script.length }
     });
 
     // Start background processing
-    processJob(jobId, { script, voice, showSubtitles });
+    processJob(jobId, jobConfig);
 
     res.json({ 
         jobId, 
@@ -133,17 +165,20 @@ app.get('/api/status/:id', (req, res) => {
         return res.status(404).json({ error: "Job not found" });
     }
 
-    if (job.status === 'completed') {
+    // Don't leak the API key in the status response
+    const { config, ...safeJobData } = job;
+    
+    if (safeJobData.status === 'completed') {
         return res.json({
-            id: job.id,
+            id: safeJobData.id,
             status: 'completed',
-            videoUrl: `${CLIENT_URL}/videos/${job.filename}`,
+            videoUrl: `${CLIENT_URL}/videos/${safeJobData.filename}`,
             expiresIn: "48 hours",
-            completedAt: job.completedAt
+            completedAt: safeJobData.completedAt
         });
     }
 
-    res.json(job);
+    res.json(safeJobData);
 });
 
 // --- Worker Logic ---
@@ -278,7 +313,7 @@ app.listen(PORT, () => {
     console.log(`Video Storage:     ${VIDEO_STORAGE_DIR}`);
     console.log(`Retention Policy:  48 Hours`);
     console.log(`\nEndpoints:`);
-    console.log(`- POST /api/generate`);
+    console.log(`- POST /api/generate (Requires 'x-google-api-key' header)`);
     console.log(`- GET  /api/status/:id`);
     console.log(`- GET  /api/voices`);
 });
